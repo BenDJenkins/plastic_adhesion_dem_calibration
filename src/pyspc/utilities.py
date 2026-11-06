@@ -167,7 +167,7 @@ def build_preprocessing_registry(target_dir: str, base_dir: str, blacklisted_str
     return df_registry
 
 
-def generate_particle_properties(radius, youngs_modulus_bounds=(10e3, 50e12), plasticity_ratio_bounds=(0.01, 0.95)):
+def generate_particle_properties(radius, youngs_modulus_bounds=(1e5, 200e9), plasticity_ratio_bounds=(0.01, 0.95)):
     """Generates a dictionary of particle properties for optimization."""
     return {
         'radius': radius,
@@ -196,7 +196,7 @@ def generate_needle_properties():
 
 def generate_substrate_properties():
     return {
-        'youngs_modulus': 1e9,  # Young's modulus for teflon (Pa)
+        'youngs_modulus': 2000e9,  # Young's modulus for teflon (Pa)
         'poisson_ratio': 0.4,  # Poisson's ratio for teflon
     }
 
@@ -216,3 +216,37 @@ def calculate_r_star(radius, radius2=None):
 def calculate_e_star(E1, nu1, E2, nu2):
     """Calculates the effective modulus for two materials in contact."""
     return 1 / ((1 - nu1**2) / E1 + (1 - nu2**2) / E2)
+
+
+def change_raw_data_units(data, force_col_in='force_nN', dist_col_in='indentation_um'):
+    """
+    Converts raw experimental data into standard SI units (Meters and Newtons).
+    Returns a copy of the DataFrame with new standardized columns.
+    """
+    df = data.copy()
+    
+    # Convert micrometers to meters (1 um = 1e-6 m)
+    if dist_col_in in df.columns:
+        df['indentation_m'] = df[dist_col_in] * 1e-6
+        
+    # Convert nanoNewtons to Newtons (1 nN = 1e-9 N)
+    if force_col_in in df.columns:
+        df['force_N'] = df[force_col_in] * 1e-9
+        
+    return df
+
+
+def get_baseline_for_sample(sample_file_path):
+    """
+    Finds the baseline NSA file located in the same directory as the given sample file.
+    """
+    parent_dir = os.path.dirname(sample_file_path)
+    
+    # Search for any file containing 'baseline' in the filename
+    baseline_files = [f for f in os.listdir(parent_dir) 
+                      if 'baseline' in f.lower() and f.endswith('.nsa')]
+                      
+    if not baseline_files:
+        raise FileNotFoundError(f"No baseline NSA file found in folder: {parent_dir}")
+        
+    return os.path.join(parent_dir, baseline_files[0])

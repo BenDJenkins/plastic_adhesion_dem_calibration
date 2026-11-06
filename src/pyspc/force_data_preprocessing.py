@@ -2,6 +2,8 @@ import pandas as pd
 import io
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from .utilities import change_raw_data_units
 
 
 def read_data(input_nsa_file):
@@ -29,7 +31,7 @@ def read_data(input_nsa_file):
     return df
 
 
-def remove_zero_force(df, force_col='force_nN', mode='start', window_size_percentage=0.02, gradient_threshold_percentage=0.015):
+def remove_zero_force(df, force_col='force_nN', mode='start', window_size_percentage=0.03, gradient_threshold_percentage=0.015):
     """
     Removes zero-force non-contact regions from data curves.
     
@@ -104,7 +106,7 @@ def _find_unloading_start(df_post, force_col, window_size, threshold_frac):
 
 
 def split_indentation_phases(df, force_col='force_nN', dist_col='indentation_um', 
-                             window_size=3, gradient_threshold_frac=0.5):
+                             window_size=3, gradient_threshold_frac=0.55):
     """
     Splits indentation data into loading, backlash, and unloading sections.
     """
@@ -139,7 +141,7 @@ def split_indentation_phases(df, force_col='force_nN', dist_col='indentation_um'
     return df_loading, df_backlash, df_unloading
 
 
-def offset_unloading_by_backlash(df_b, df_u, dist_col='indentation_um'):
+def offset_unloading_by_backlash(df_b, df_u, dist_col):
     """
     Offsets the unloading curve by the maximum indentation of the backlash curve.
     """
@@ -153,7 +155,7 @@ def offset_unloading_by_backlash(df_b, df_u, dist_col='indentation_um'):
     return df_u
 
 
-def zero_indentation(df_l, df_u, df_b=None, dist_col='indentation_um'):
+def zero_indentation(df_l, df_u, df_b=None, dist_col='indentation_m'):
     """
     Adjusts the indentation values so that the minimum indentation is zero.
     """
@@ -176,7 +178,7 @@ def zero_indentation(df_l, df_u, df_b=None, dist_col='indentation_um'):
     return df_l, df_u, df_b
 
 
-def preprocess_force_data(file_path, threshold = 0.05, force_col='force_nN', dist_col='indentation_um', window_size_percentage=0.04, gradient_threshold_percentage=0.015):
+def preprocess_force_data(file_path, threshold = 0.07, force_col='force_nN', dist_col='indentation_um', window_size_percentage=0.04, gradient_threshold_percentage=0.015):
     """
     Preprocesses indentation-force data from a given file path.
     Steps:
@@ -235,20 +237,60 @@ def preprocess_force_data_2575_method(file_path, threshold = 0.05, force_col='fo
     # First remove the pre-contact (lead-up) data
     data = read_data(file_path)
 
-    cleaner_data = remove_zero_force_2575_method(data)
+    data_in_si_units = change_raw_data_units(data)
 
-    df_l, df_b, df_u = split_indentation_phases(cleaner_data)
+    si_force = 'force_N'
+    si_dist = 'indentation_m'
 
-    # Move unloading curve to align with loading curve
-    df_u = offset_unloading_by_backlash(df_b, df_u, dist_col=dist_col)
+    cleaner_data = remove_zero_force_2575_method(data_in_si_units, force_col=si_force, dist_col=si_dist)
 
-    # Zero the indentation values for both loading and unloading curves
-    df_l, df_u, _ = zero_indentation(df_l, df_u, dist_col=dist_col)
+    df_l_corrected = apply_compliance_correction(df_l, df_baseline)
+    df_u_corrected = apply_compliance_correction(df_u, df_baseline)
+
+    df_l, df_b, df_u = split_indentation_phases(cleaner_data, force_col=si_force, dist_col=si_dist)
+
+    df_u = offset_unloading_by_backlash(df_b, df_u, dist_col=si_dist)
+    df_l, df_u, _ = zero_indentation(df_l, df_u, dist_col=si_dist)
 
     return df_l, df_u
 
 
-def remove_zero_force_2575_method(data, force_col='force_nN', dist_col='indentation_um'):
+def preprocess_paired_data(sample_file_path, baseline_file_path, force_col='force_N', dist_col='indentation_m'):
+    """
+    Preprocesses a particle indentation file by pairing it with its full-cycle 
+    baseline (loading, backlash, and unloading).
+    """
+    # 1. Read and convert BOTH to SI units
+    df_samp = change_raw_data_units(read_data(sample_file_path))
+    df_base = change_raw_data_units(read_data(baseline_file_path))
+
+    # 2. Clean the air-phase and zero the sensor drift for BOTH
+    clean_samp = remove_zero_force_2575_method(df_samp, force_col=force_col, dist_col=dist_col)
+    clean_base = remove_zero_force_2575_method(df_base, force_col=force_col, dist_col=dist_col)
+
+    # 3. Split BOTH curves into their three physical phases
+    samp_l, samp_b, samp_u = split_indentation_phases(clean_samp, force_col=force_col, dist_col=dist_col)
+    base_l, base_b, base_u = split_indentation_phases(clean_base, force_col=force_col, dist_col=dist_col)
+
+    # 4. Phase-by-Phase Compliance Correction
+    # Maps Loading to Loading, Backlash to Backlash, and Unloading to Unloading
+    samp_l_corr = apply_compliance_correction(samp_l, base_l, force_col=force_col, dist_col=dist_col)
+    samp_b_corr = apply_compliance_correction(samp_b, base_b, force_col=force_col, dist_col=dist_col)
+    samp_u_corr = apply_compliance_correction(samp_u, base_u, force_col=force_col, dist_col=dist_col)
+
+    # 5. Apply Backlash Offset & Zeroing using the CORRECTED arrays
+    # This mathematically removes machine hysteresis from the final particle curve
+    samp_u_final = offset_unloading_by_backlash(samp_b_corr, samp_u_corr, dist_col=dist_col)
+    samp_l_final, samp_u_final, _ = zero_indentation(samp_l_corr, samp_u_final, samp_b_corr, dist_col=dist_col)
+
+    # 6. Final safety filter to prevent any < 0.0 values causing optimizer crashes
+    samp_l_final = samp_l_final[samp_l_final[dist_col] >= 0.0]
+    samp_u_final = samp_u_final[samp_u_final[dist_col] >= 0.0]
+
+    return samp_l_final, samp_u_final
+
+
+def remove_zero_force_2575_method(data, force_col, dist_col):
 
     # First we find the max indentation point to get max force
     idx_max_h = data[dist_col].idxmax()
@@ -290,3 +332,116 @@ def remove_zero_force_2575_method(data, force_col='force_nN', dist_col='indentat
 
     return pd.concat([df_l_clean, df_u_clean], axis=0)
     
+
+def apply_compliance_correction_loading_only(df_sample, df_baseline, force_col='force_N', dist_col='indentation_m'):
+    """
+    Subtracts the substrate (Teflon) deflection from the sample data.
+    Both dataframes must already be preprocessed and in SI units.
+    """
+    df_corrected = df_sample.copy()
+    
+    # 1. Isolate the loading portion of the baseline to create a compliance map
+    idx_max_base = df_baseline[dist_col].idxmax()
+    base_load = df_baseline.loc[:idx_max_base].copy()
+    
+    # Sort values to ensure the interpolation function works smoothly
+    base_load = base_load.sort_values(by=force_col)
+    
+    # 2. Create an interpolation function: Force -> Substrate Displacement
+    # 'extrapolate' handles cases where the sample force slightly exceeds the baseline force
+    compliance_func = interp1d(
+        base_load[force_col], 
+        base_load[dist_col], 
+        kind='linear', 
+        fill_value='extrapolate'
+    )
+    
+    # 3. Calculate how much the Teflon deflected at these specific force values
+    substrate_deflection = compliance_func(df_corrected[force_col])
+    
+    # Prevent subtracting negative deflections if sensor noise dips below 0
+    substrate_deflection = np.maximum(0, substrate_deflection)
+    
+    # 4. Subtract substrate displacement from the sample displacement
+    df_corrected[dist_col] = df_corrected[dist_col] - substrate_deflection
+    
+    # Clean up any negative displacements caused by the subtraction at the very beginning
+    df_corrected = df_corrected[df_corrected[dist_col] >= 0.0]
+    
+    return df_corrected
+
+
+def apply_compliance_correction(df_sample_phase, df_base_phase, force_col='force_N', dist_col='indentation_m'):
+    """
+    Subtracts the machine/substrate deflection from a specific isolated phase 
+    (loading, backlash, or unloading).
+    """
+    df_corrected = df_sample_phase.copy()
+    
+    if df_corrected.empty or df_base_phase.empty:
+        return df_corrected
+        
+    # Sort baseline by force to ensure monotonically increasing X-values for interpolation
+    df_base_phase = df_base_phase.sort_values(by=force_col).drop_duplicates(subset=[force_col])
+    
+    # Create interpolation map: Force -> Machine Displacement
+    compliance_func = interp1d(
+        df_base_phase[force_col], 
+        df_base_phase[dist_col], 
+        kind='linear', 
+        fill_value='extrapolate'
+    )
+    
+    # Calculate how much the machine deflected at the sample's specific force values
+    substrate_deflection = compliance_func(df_corrected[force_col])
+    
+    # Subtract machine displacement from the sample displacement
+    df_corrected[dist_col] = df_corrected[dist_col] - np.maximum(0, substrate_deflection)
+    
+    return df_corrected
+
+
+def preprocess_baseline_data(file_path, force_col='force_N', dist_col='indentation_m'):
+    """
+    Dedicated preprocessor for loading-only baseline (Teflon) files.
+    """
+    data = read_data(file_path)
+    data = change_raw_data_units(data)
+
+    # 1. Baseline drift correction (zero the sensor)
+    n_baseline_points = max(5, int(len(data) * 0.05))
+    baseline_offset = data[force_col].head(n_baseline_points).mean()
+    data[force_col] = data[force_col] - baseline_offset
+
+    # 2. Find maximum force and calculate 25/75 thresholds
+    force_max = data[force_col].max()
+    force_min = data[force_col].min()
+
+    amp = force_max - force_min
+    force_25 = force_min + (0.25 * amp)
+    force_75 = force_min + (0.75 * amp)
+
+    # 3. Find indices closest to 25% and 75%
+    idx_25 = data[force_col].sub(force_25).abs().idxmin()
+    idx_75 = data[force_col].sub(force_75).abs().idxmin()
+
+    # --- FIXED: Ensure indices are in the correct order to prevent empty slices! ---
+    idx_start = min(idx_25, idx_75)
+    idx_end = max(idx_25, idx_75)
+    
+    df_fit = data.loc[idx_start:idx_end]
+
+    # 4. Fit linear curve to find true contact point (h0) safely
+    if len(df_fit) >= 2:
+        coeffs = np.polyfit(df_fit[dist_col], df_fit[force_col], 1)
+        h0 = -coeffs[1] / coeffs[0] if coeffs[0] != 0 else df_fit[dist_col].iloc[0]
+    else:
+        # Fallback if the data is too sparse to fit a line
+        h0 = data.loc[idx_start, dist_col]
+
+    # 5. Clean pre-contact data and shift x-axis so contact is at exactly 0.0 m
+    df_clean = data[data[dist_col] >= h0].copy()
+    if not df_clean.empty:
+        df_clean[dist_col] = df_clean[dist_col] - h0
+
+    return df_clean
